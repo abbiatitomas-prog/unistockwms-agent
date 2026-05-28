@@ -28,11 +28,13 @@
 // ═══════════════════════════════════════════════════════════════
 
 import axios, { AxiosError } from 'axios';
+import { spawn } from 'child_process';
 import * as net from 'net';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 
-const AGENT_VERSION = '0.1.0';
+const AGENT_VERSION = '1.2.0';
 
 interface Config {
   backendUrl: string;
@@ -42,16 +44,34 @@ interface Config {
   zplPort: number;
   socketTimeoutMs: number;
   logLevel: 'info' | 'debug';
+  sumatraPath: string;
+  defaultPdfPrinter: string | null;
+  pdfDownloadTimeoutMs: number;
 }
 
+interface PdfJob {
+  id: string;
+  printerId: string;
+  printerName: string;
+  printerAddress: string | null;
+  kind: 'pdf';
+  pdfUrl: string;
+  windowsPrinterName?: string;
+}
+
+interface ZplJob {
+  id: string;
+  printerId: string;
+  printerName: string;
+  printerAddress: string | null;
+  kind?: 'zpl';
+  zpl: string;
+}
+
+type Job = PdfJob | ZplJob;
+
 interface PollResponse {
-  jobs: Array<{
-    id: string;
-    printerId: string;
-    printerName: string;
-    printerAddress: string | null;
-    zpl: string;
-  }>;
+  jobs: Job[];
 }
 
 function loadEnv(): void {
@@ -85,6 +105,11 @@ function loadConfig(): Config {
     zplPort: parseInt(process.env.ZPL_PORT ?? '9100', 10),
     socketTimeoutMs: parseInt(process.env.SOCKET_TIMEOUT_MS ?? '10000', 10),
     logLevel: (process.env.LOG_LEVEL as 'info' | 'debug') ?? 'info',
+    sumatraPath:
+      process.env.SUMATRA_PATH ??
+      'C:\\Program Files\\SumatraPDF\\SumatraPDF.exe',
+    defaultPdfPrinter: process.env.PRINTER_NAME_PDF ?? null,
+    pdfDownloadTimeoutMs: parseInt(process.env.PDF_DOWNLOAD_TIMEOUT_MS ?? '30000', 10),
   };
 }
 
@@ -136,6 +161,64 @@ function sendZpl(address: string, port: number, zpl: string, timeoutMs: number):
   });
 }
 
+/**
+ * Descarga un PDF a un archivo temp y lo imprime vía SumatraPDF en silencioso.
+ * SumatraPDF es el único viewer Windows con flag `-print-to <name> -silent`
+ * que funciona sin abrir ventana ni pedir confirmación. Free + portable.
+ *
+ * Descarga: GET pdfUrl con auth header del agent (el endpoint /labels/<token>
+ * acepta token HMAC en query — no necesita header). Tira si tarda >30s.
+ */
+async function printPdf(
+  cfg: Config,
+  pdfUrl: string,
+  windowsPrinterName: string,
+): Promise<{ ok: boolean; error?: string }> {
+  // 1) Descargar a temp file
+  const tmpFile = path.join(os.tmpdir(), `unistock-label-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.pdf`);
+  try {
+    const resp = await axios.get<ArrayBuffer>(pdfUrl, {
+      responseType: 'arraybuffer',
+      timeout: cfg.pdfDownloadTimeoutMs,
+      maxRedirects: 5,
+    });
+    fs.writeFileSync(tmpFile, Buffer.from(resp.data));
+  } catch (e) {
+    const err = e as AxiosError;
+    return { ok: false, error: `pdf_download_failed: ${err.message}` };
+  }
+
+  // 2) Verificar SumatraPDF instalado
+  if (!fs.existsSync(cfg.sumatraPath)) {
+    try { fs.unlinkSync(tmpFile); } catch { /* ignore */ }
+    return {
+      ok: false,
+      error: `SumatraPDF no instalado en ${cfg.sumatraPath} (override con SUMATRA_PATH)`,
+    };
+  }
+
+  // 3) Lanzar SumatraPDF silencioso
+  return new Promise((resolve) => {
+    const args = ['-print-to', windowsPrinterName, '-silent', tmpFile];
+    const child = spawn(cfg.sumatraPath, args, { windowsHide: true });
+    let stderr = '';
+    child.stderr.on('data', (d) => { stderr += d.toString(); });
+    child.on('error', (err) => {
+      try { fs.unlinkSync(tmpFile); } catch { /* ignore */ }
+      resolve({ ok: false, error: `spawn_failed: ${err.message}` });
+    });
+    child.on('close', (code) => {
+      try { fs.unlinkSync(tmpFile); } catch { /* ignore */ }
+      if (code === 0) resolve({ ok: true });
+      else resolve({ ok: false, error: `sumatra_exit_${code}${stderr ? ': ' + stderr.slice(0, 200) : ''}` });
+    });
+    // Hard timeout 60s — sumatra colgada no debe bloquear el loop.
+    setTimeout(() => {
+      try { child.kill(); } catch { /* ignore */ }
+    }, 60_000);
+  });
+}
+
 async function pollOnce(cfg: Config): Promise<void> {
   let resp;
   try {
@@ -164,11 +247,37 @@ async function pollOnce(cfg: Config): Promise<void> {
   log('info', 'jobs_received', { count: jobs.length });
 
   for (const job of jobs) {
+    // Rama PDF — desde v1.2.0: pack-station encola etiquetas carrier como PDF
+    // y el agent las baja + manda a SumatraPDF en la driver Windows.
+    if (job.kind === 'pdf') {
+      const pdfJob = job as PdfJob;
+      const winPrinter = pdfJob.windowsPrinterName ?? cfg.defaultPdfPrinter;
+      if (!winPrinter) {
+        await reportFail(
+          cfg,
+          job.id,
+          'printer sin windowsPrinterName (set en notes JSON o PRINTER_NAME_PDF env)',
+        );
+        continue;
+      }
+      const result = await printPdf(cfg, pdfJob.pdfUrl, winPrinter);
+      if (result.ok) {
+        log('info', 'job_pdf_printed', { jobId: job.id, printer: job.printerName, winPrinter });
+        await reportDone(cfg, job.id);
+      } else {
+        log('warn', 'job_pdf_failed', { jobId: job.id, printer: job.printerName, error: result.error });
+        await reportFail(cfg, job.id, result.error ?? 'unknown pdf error');
+      }
+      continue;
+    }
+
+    // Rama ZPL clásica (cajones depósito / etiquetas internas)
+    const zplJob = job as ZplJob;
     if (!job.printerAddress) {
       await reportFail(cfg, job.id, 'printer sin address configurada');
       continue;
     }
-    const result = await sendZpl(job.printerAddress, cfg.zplPort, job.zpl, cfg.socketTimeoutMs);
+    const result = await sendZpl(job.printerAddress, cfg.zplPort, zplJob.zpl, cfg.socketTimeoutMs);
     if (result.ok) {
       log('info', 'job_printed', { jobId: job.id, printer: job.printerName, bytes: result.bytesSent });
       await reportDone(cfg, job.id);

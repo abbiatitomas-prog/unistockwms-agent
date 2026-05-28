@@ -1,6 +1,6 @@
 {
   "name": "unistockwms-agent",
-  "version": "0.1.0",
+  "version": "1.2.0",
   "description": "Agente local que pollea jobs PENDING desde Railway y manda ZPL a las Zebras de la LAN del depo.",
   "private": true,
   "main": "dist/index.js",
